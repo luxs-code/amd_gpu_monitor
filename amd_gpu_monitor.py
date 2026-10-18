@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2026 <your name>
-"""Show which programs use the VRAM of AMD GPUs on Linux.
+# Copyright (c) 2026 Luxs
+"""amd_gpu_monitor - see what is using your AMD GPUs on Linux: memory per
+program, load, clocks, temperatures, power and running model servers.
 
 Graphics programs are read from /proc/<pid>/fdinfo. GPU memory belongs to a
 GPU client (an open file), which several processes can hold at once. Each
@@ -28,17 +29,30 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import textwrap
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
-__version__ = "2.9.0"
+# ===========================================================================
+#  EDIT HERE: name and credit line
+#  CREDIT_LINE is printed at the bottom of every view, in --help and in
+#  --version. Set it to "" to print nothing.
+# ===========================================================================
+PROGRAM = "amd_gpu_monitor"
+CREDIT_LINE = ("(c) Luxs 2026 · GitHub: https://github.com/luxs-code/amd_gpu_monitor"
+               " · Web: https://mycoding.uk/")
+# ===========================================================================
+
+__version__ = "2.10.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -54,6 +68,13 @@ TIGHT_FREE = int(2.5 * GIB)     # below this, warn that room is tight
 EVICTED_NOTICE = 512 * MIB      # mention evicted memory above this
 EVICTED_HIGHLIGHT = 64 * MIB    # highlight a program's evicted memory above this
 TEMP_WARN_MARGIN = 10.0         # warn this many degrees below a sensor's critical limit
+# Per-program GPU time: fdinfo drm-engine-<name> is each client's cumulative
+# busy time per engine type, in ns (amdgpu_fdinfo.c). GPU% = growth of the
+# shader engines' time between two refreshes / elapsed time; several rings of
+# one type running at once can push it above 100%. ROCm work runs on
+# user-mode queues outside this accounting (KFD's per-process cu_occupancy
+# exists only on gfx9 GPUs), so ROCm rows show n/a.
+SHADER_ENGINES = ("gfx", "compute")
 
 # GPU sensors (hwmon), checked against the amdgpu driver of Linux 5.19-6.17 and
 # its own documentation (DOC: hwmon in drivers/gpu/drm/amd/pm/amdgpu_pm.c):
@@ -68,6 +89,8 @@ TEMP_WARN_MARGIN = 10.0         # warn this many degrees below a sensor's critic
 #     explicitly). power1_input: instantaneous SoC power (Linux 6.12+). These
 #     are different sensors and are reported separately. On APUs both
 #     include the CPU, so they are labelled "SoC", not "GPU".
+#   freq1_input: shader (gfx/compute) clock, freq2_input: memory clock, both
+#     in hertz (all versions 5.19-6.17), read under the same sleep rule.
 #   power1_cap: the selected power limit, microwatts. power1_label: "PPT"
 #     (or "slowPPT"/"fastPPT" on one APU).
 #   Side effect: up to Linux 6.14, reading gpu_busy_percent or any of these
@@ -77,6 +100,7 @@ TEMP_WARN_MARGIN = 10.0         # warn this many degrees below a sensor's critic
 #   Values outside the ranges below are treated as bad readings.
 TEMP_RANGE = (-40.0, 200.0)     # degrees Celsius
 POWER_RANGE = (0.0, 3000.0)     # watts
+CLOCK_RANGE = (1.0, 10000.0)    # MHz
 TEMP_NAMES = {"edge": "edge", "junction": "hotspot", "mem": "memory"}
 ASLEEP_STATES = {"suspended", "suspending"}
 
@@ -219,6 +243,10 @@ class GpuDevice:
     power: PowerReading | None = None
     runtime_status: str | None = None        # "active", "suspended", ...
     xgmi_hive: str | None = None             # GPUs in one hive share VRAM mappings
+    vram_used_reported: int | None = None    # raw reading; vram_used is capped at total
+    gtt_used_reported: int | None = None
+    sclk_mhz: float | None = None            # shader (gfx/compute) clock
+    mclk_mhz: float | None = None            # memory clock
 
     @property
     def asleep(self) -> bool:
@@ -244,6 +272,7 @@ class ClientUsage:
     owner: int                # the process it is credited to
     attribution: str          # "kernel", "sole-holder", "system" or "heuristic"
     in_vram_capped: bool = False   # estimate was capped at the card's VRAM use
+    engine_ns: dict[str, int] = field(default_factory=dict)   # drm-engine-*: busy time
 
 
 @dataclass
@@ -320,6 +349,18 @@ class ProcessUsage:
 
 
 @dataclass
+class ModelServer:
+    """A local model server and what it reports."""
+    kind: str                 # "Ollama", "llama.cpp", "vLLM", ...
+    pid: int | None           # None: found at its default address, not by process
+    address: str              # "127.0.0.1:11434", or "" if its port is not known
+    status: str               # "ok", "no reply", "refused", "HTTP 404",
+                              # "unexpected reply", "port unknown"
+    models: list[str] = field(default_factory=list)          # served model names
+    loaded: list[OllamaModel] = field(default_factory=list)  # Ollama: with sizes
+
+
+@dataclass
 class OllamaModel:
     name: str
     size: int
@@ -339,9 +380,11 @@ class Snapshot:
     averages: dict[str, dict[str, dict[str, float]]] = field(default_factory=dict)
     averaged_seconds: float = 0.0     # how much time the averages cover so far
     ollama_running: bool = False      # Ollama answered, even with no model loaded
+    servers: list[ModelServer] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
+            "program": PROGRAM,
             "version": __version__,
             "timestamp": self.timestamp.isoformat(timespec="seconds"),
             "root": self.is_root,
@@ -356,6 +399,7 @@ class Snapshot:
             "averages": self.averages,                 # live view only
             "averaged_seconds": self.averaged_seconds,
             "ollama_running": self.ollama_running,
+            "servers": [asdict(x) for x in self.servers],
         }
 
 
@@ -629,8 +673,9 @@ def _scaled(path: str, divisor: float, valid: tuple[float, float]) -> float | No
     return value if valid[0] <= value <= valid[1] else None
 
 
-def _amdgpu_hwmon(path: str) -> tuple[list[TempSensor], PowerReading | None]:
-    """Temperatures and power from the GPU's own amdgpu hwmon chip."""
+def _amdgpu_hwmon(path: str) -> tuple[list[TempSensor], PowerReading | None,
+                                       dict[str, float]]:
+    """Temperatures, power and clocks (MHz) from the GPU's own amdgpu hwmon chip."""
     for hw in sorted(glob.glob(f"{path}/hwmon/hwmon*")):
         if (_read(f"{hw}/name") or "").strip() != "amdgpu":
             continue                  # not amdgpu's chip: units not guaranteed
@@ -655,28 +700,35 @@ def _amdgpu_hwmon(path: str) -> tuple[list[TempSensor], PowerReading | None]:
             label=(_read(f"{hw}/power1_label") or "").strip() or None)
         if power.average_w is None and power.input_w is None:
             power = None
-        return sensors, power
-    return [], None
+        clocks = {name: mhz for name, attr in (("sclk", "freq1_input"), ("mclk", "freq2_input"))
+                  for mhz in [_scaled(f"{hw}/{attr}", 1e6, CLOCK_RANGE)] if mhz is not None}
+        return sensors, power, clocks
+    return [], None, {}
 
 
 def read_device(gpu: PciGpu) -> GpuDevice:
     status = (_read(f"{gpu.path}/power/runtime_status") or "").strip() or None
     asleep = status in ASLEEP_STATES          # reading sensors could wake it
     busy = "" if asleep else (_read(f"{gpu.path}/gpu_busy_percent") or "").strip()
-    sensors, power = ([], None) if asleep else _amdgpu_hwmon(gpu.path)
+    sensors, power, clocks = ([], None, {}) if asleep else _amdgpu_hwmon(gpu.path)
     legacy_power = None if power is None else (
         power.average_w if power.average_w is not None else power.input_w)
     total = _int(_read(f"{gpu.path}/mem_info_vram_total"))
+    raw_vram_used = _int(_read(f"{gpu.path}/mem_info_vram_used"))
+    gtt_total = _int(_read(f"{gpu.path}/mem_info_gtt_total"))
+    raw_gtt_used = _int(_read(f"{gpu.path}/mem_info_gtt_used"))
     hive = (_read(f"{gpu.path}/xgmi_hive_info/xgmi_hive_id") or "").strip()  # "0"/absent: none
     return GpuDevice(
         address=gpu.address, name=_gpu_name(gpu), vram_total=total,
-        vram_used=min(_int(_read(f"{gpu.path}/mem_info_vram_used")), total),
-        gtt_total=_int(_read(f"{gpu.path}/mem_info_gtt_total")),
-        gtt_used=_int(_read(f"{gpu.path}/mem_info_gtt_used")),
+        vram_used=min(raw_vram_used, total), vram_used_reported=raw_vram_used,
+        gtt_total=gtt_total,
+        gtt_used=min(raw_gtt_used, gtt_total) if gtt_total else raw_gtt_used,
+        gtt_used_reported=raw_gtt_used,
         busy_percent=int(busy) if busy.isdigit() and int(busy) <= 100 else None,
         temperatures=[(x.label, x.celsius) for x in sensors],
         power_watts=legacy_power, temperature_sensors=sensors, power=power,
-        runtime_status=status, xgmi_hive=hive if hive.strip("0") else None)
+        runtime_status=status, xgmi_hive=hive if hive.strip("0") else None,
+        sclk_mhz=clocks.get("sclk"), mclk_mhz=clocks.get("mclk"))
 
 
 def _kfd_gpu_addresses() -> dict[str, str]:
@@ -743,15 +795,17 @@ def collect_processes(capacities: dict[str, int], used: dict[str, int] | None = 
             continue
         pasid = info.get("pasid", ("",))[0]
         cid = (address, info["drm-client-id"][0])
+        engine = {k[len("drm-engine-"):]: int(v) for k, (v, unit) in info.items()
+                  if k.startswith("drm-engine-") and "capacity" not in k
+                  and v.isdigit() and unit in ("ns", "")}
         clients.setdefault(cid, [requested, evicted, resident,
                                  int(pasid) if pasid.isdigit() else None,
-                                 set()])[4].add(path.split("/")[2])
+                                 set(), engine])[4].add(path.split("/")[2])
 
     # Credit each client to one holder, per GPU
     owners = _kernel_client_owners()
     graphics: dict[tuple[str, str | None], list[ClientUsage]] = {}
-    implausible_resident = 0
-    for (address, cid), (requested, evicted, resident, pasid, pids) in clients.items():
+    for (address, cid), (requested, evicted, resident, pasid, pids, engine) in clients.items():
         cap = capacity(address)
         if requested is not None and evicted is not None:
             evicted = min(evicted, requested)
@@ -764,7 +818,6 @@ def collect_processes(capacities: dict[str, int], used: dict[str, int] | None = 
         elif requested is None:               # pre-6.4 kernel, implausible resident
             in_vram, source = 0, "unavailable"
         else:
-            implausible_resident += resident is not None
             estimate = max(0, requested - (evicted or 0))
             in_vram, source = min(estimate, in_use(address)), "requested-minus-evicted"
             capped = estimate > in_vram
@@ -772,7 +825,7 @@ def collect_processes(capacities: dict[str, int], used: dict[str, int] | None = 
         graphics.setdefault((pid, address), []).append(ClientUsage(
             client_id=cid, gpu=address, pasid=pasid, requested=requested, evicted=evicted,
             resident_reported=resident, in_vram=in_vram, in_vram_source=source,
-            in_vram_capped=capped,
+            in_vram_capped=capped, engine_ns=engine,
             holders=sorted(int(p) for p in pids), owner=int(pid), attribution=how))
 
     # Compute (ROCm) memory, per GPU
@@ -874,29 +927,180 @@ def collect_processes(capacities: dict[str, int], used: dict[str, int] | None = 
         warnings.append("This kernel does not report per-program GPU memory, "
                         "so only compute (ROCm) programs are listed. A newer "
                         "kernel is needed for the full table.")
+    elif without_stats:
+        warnings.append(f"{without_stats} GPU client(s) report no usable memory "
+                        "statistics and are not included in the table.")
     ordered = sorted(usage.values(), key=lambda u: (u.kind != "compute", -_row_size(u)))
     return ordered, compute_by_device, warnings
 
 
-def fetch_ollama_models() -> list[OllamaModel] | None:
-    """Models loaded in Ollama ([] if none), or None if Ollama is unreachable."""
-    host = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
-    if not host.startswith(("http://", "https://")):
-        host = "http://" + host
+# Model servers. Recognised by process name; their listening TCP ports come
+# from /proc/<pid>/fd and /proc/net/tcp{,6} (root is needed for other users'
+# processes); their models are asked over HTTP: Ollama /api/ps (loaded models
+# with sizes), the others the OpenAI-compatible /v1/models. Children of a
+# server (Ollama's internal llama-server, worker processes) are skipped.
+MODEL_SERVERS = (       # label, executable names, Python module prefixes, API
+    ("Ollama", ("ollama",), (), "ollama"),
+    ("llama.cpp", ("llama-server", "llamafile"), (), "openai"),
+    ("vLLM", ("vllm",), ("vllm.",), "openai"),
+    ("SGLang", (), ("sglang.",), "openai"),
+    ("LM Studio", ("lm studio", "lm-studio", "lmstudio", "llmster"), (), "openai"),
+    ("KoboldCpp", ("koboldcpp",), (), "openai"),
+    ("LocalAI", ("local-ai",), (), "openai"),
+    ("TGI", ("text-generation-launcher", "text-generation-router"), (), "openai"),
+)
+SERVER_TIMEOUT = 0.5    # seconds per request; requests run in parallel
+SERVER_PORTS_TRIED = 3  # a server listening on many ports: ask at most this many
+
+
+def _server_kind(pid: str) -> tuple[str, str] | None:
+    """(label, API) if the process is a known model server."""
+    argv = [a for a in (_read(f"/proc/{pid}/cmdline") or "").split("\0") if a]
+    names = {_comm(pid).lower()} | ({os.path.basename(argv[0]).lower()} if argv else set())
+    for label, executables, modules, api in MODEL_SERVERS:
+        for name in names:
+            for exe in executables:
+                if (name == exe or name.startswith((exe + "-", exe + "."))
+                        or (exe == "llamafile" and name.endswith(".llamafile"))):
+                    return label, api
+        if any(arg.startswith(modules) for arg in argv[1:]) if modules else False:
+            return label, api
+    return None
+
+
+def _parent(pid: str) -> str | None:
+    stat = _read(f"/proc/{pid}/stat") or ""
+    fields = stat[stat.rfind(")") + 2:].split()
+    return fields[1] if len(fields) > 1 and fields[1].isdigit() else None
+
+
+def _decode_ip(hex_ip: str) -> str:
+    """An address from /proc/net/tcp{,6}: hex words in little-endian order."""
+    raw = bytes.fromhex(hex_ip)
+    if len(raw) == 4:
+        return socket.inet_ntop(socket.AF_INET, raw[::-1])
+    words = b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4))
+    return socket.inet_ntop(socket.AF_INET6, words)
+
+
+def _listening_sockets() -> dict[str, tuple[str, int]]:
+    """socket inode -> (address, port) for every listening TCP socket."""
+    out: dict[str, tuple[str, int]] = {}
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        for line in (_read(path) or "").splitlines()[1:]:
+            f = line.split()
+            if len(f) > 9 and f[3] == "0A":           # 0A = LISTEN
+                ip, port = f[1].split(":")
+                try:
+                    out[f[9]] = (_decode_ip(ip), int(port, 16))
+                except ValueError:
+                    continue
+    return out
+
+
+def _ports_of(pid: str, listening: dict[str, tuple[str, int]]) -> list[tuple[str, int]]:
+    ports = []
+    for fd in glob.glob(f"/proc/{pid}/fd/*"):
+        try:
+            link = os.readlink(fd)
+        except OSError:
+            continue
+        if link.startswith("socket:[") and link[8:-1] in listening:
+            ports.append(listening[link[8:-1]])
+    return sorted(set(ports), key=lambda x: x[1])
+
+
+def _url_host(ip: str) -> str:
+    if ip in ("0.0.0.0", "127.0.0.1"):
+        return "127.0.0.1"
+    if ip in ("::", "::1"):
+        return "[::1]"
+    return f"[{ip}]" if ":" in ip else ip
+
+
+def _ask(url: str) -> tuple[str, object]:
+    """GET url and parse JSON. Status: "ok", "no reply", "refused",
+    "HTTP <code>", "unexpected reply" (not JSON) or "unreachable"."""
     try:
-        with urllib.request.urlopen(host.rstrip("/") + "/api/ps",
-                                    timeout=0.5) as response:
-            data = json.load(response)
-    except Exception:
-        return None
-    return [OllamaModel(_safe(str(m.get("name", "?"))), int(m.get("size", 0)),
-                        int(m.get("size_vram", 0)))
-            for m in data.get("models") or []]
+        with urllib.request.urlopen(url, timeout=SERVER_TIMEOUT) as response:
+            return "ok", json.load(response)
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code}", None
+    except socket.timeout:
+        return "no reply", None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ConnectionRefusedError):
+            return "refused", None
+        if isinstance(exc.reason, socket.timeout):
+            return "no reply", None
+        return "unreachable", None
+    except (ValueError, OSError):             # invalid JSON, broken connection
+        return "unexpected reply", None
+
+
+def _query_server(kind: str, api: str, pid: int | None,
+                  ports: list[tuple[str, int]]) -> ModelServer:
+    if not ports:
+        return ModelServer(kind, pid, "", "port unknown")
+    result = None
+    for ip, port in ports[:SERVER_PORTS_TRIED]:
+        base = f"http://{_url_host(ip)}:{port}"
+        status, data = _ask(base + ("/api/ps" if api == "ollama" else "/v1/models"))
+        address = f"{ip}:{port}" if ":" not in ip else f"[{ip}]:{port}"
+        if status == "ok" and api == "ollama" and isinstance(data, dict) \
+                and isinstance(data.get("models", []), list):
+            loaded = [OllamaModel(_safe(str(m.get("name", "?"))), int(m.get("size", 0)),
+                                  int(m.get("size_vram", 0)))
+                      for m in data.get("models") or [] if isinstance(m, dict)]
+            return ModelServer(kind, pid, address, "ok", [x.name for x in loaded], loaded)
+        if status == "ok" and api == "openai" and isinstance(data, dict) \
+                and isinstance(data.get("data"), list):
+            names = [_safe(str(m.get("id", "?"))) for m in data["data"] if isinstance(m, dict)]
+            return ModelServer(kind, pid, address, "ok", names)
+        if status == "ok":
+            status = "unexpected reply"
+        result = result or ModelServer(kind, pid, address, status)
+    return result
+
+
+def find_model_servers() -> list[ModelServer]:
+    """Running model servers and their models. Ollama is also looked for at
+    OLLAMA_HOST (default 127.0.0.1:11434) when no Ollama process is visible,
+    and then listed only if something answers there."""
+    listening = _listening_sockets()
+    jobs: list[tuple[str, str, int | None, list[tuple[str, int]]]] = []
+    for d in glob.glob("/proc/[0-9]*"):
+        pid = os.path.basename(d)
+        kind = _server_kind(pid)
+        if kind is None:
+            continue
+        parent = _parent(pid)
+        if parent and _server_kind(parent) is not None:
+            continue                          # a server's child or worker
+        jobs.append((kind[0], kind[1], int(pid), _ports_of(pid, listening)))
+    fallback = not any(kind == "Ollama" for kind, _, _, _ in jobs)
+    if fallback:
+        host = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+        host = host.split("://", 1)[-1].rstrip("/")
+        name, _, port = host.rpartition(":")
+        if port.isdigit():
+            jobs.append(("Ollama", "ollama", None, [(name or "127.0.0.1", int(port))]))
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as pool:
+        servers = list(pool.map(lambda job: _query_server(*job), jobs))
+    return [x for x in servers
+            if x.pid is not None or x.status not in ("refused", "unreachable")]
+
 
 
 def device_metrics(dev: GpuDevice) -> dict[str, float]:
     """The values of one GPU that the live view averages."""
     m = {"vram_used": float(dev.vram_used)}
+    if dev.sclk_mhz is not None:
+        m["sclk"] = dev.sclk_mhz
+    if dev.mclk_mhz is not None:
+        m["mclk"] = dev.mclk_mhz
     if dev.gtt_total:
         m["gtt_used"] = float(dev.gtt_used)
     if dev.asleep:
@@ -978,13 +1182,23 @@ def collect(gpus: list[PciGpu]) -> Snapshot:
     capacities, used = vram_limits(devices)
     processes, compute_by_device, warnings = collect_processes(capacities, used)
     is_root = os.geteuid() == 0
+    for d in devices:                         # the display caps these; say so if it had to
+        if d.vram_used_reported is not None and d.vram_used_reported > d.vram_total:
+            warnings.append(f"GPU {d.address} reports {_fmt(d.vram_used_reported)} of VRAM "
+                            f"used on a {_fmt(d.vram_total)} card, which is impossible; "
+                            "shown as full.")
+        if d.gtt_total and d.gtt_used_reported is not None and d.gtt_used_reported > d.gtt_total:
+            warnings.append(f"GPU {d.address} reports {_fmt(d.gtt_used_reported)} of GTT used "
+                            f"out of {_fmt(d.gtt_total)}, which is impossible.")
     if not is_root:
         warnings.append("Not running as root: graphics memory of other users' "
                         "programs may be missing (Ollama's compute memory is "
                         "still shown). Use sudo for the full picture.")
-    models = fetch_ollama_models()
-    return Snapshot(datetime.now(), devices, processes, models or [], is_root, warnings,
-                    compute_by_device, ollama_running=models is not None)
+    servers = find_model_servers()
+    ollama = next((x for x in servers if x.kind == "Ollama" and x.status == "ok"), None)
+    return Snapshot(datetime.now(), devices, processes, ollama.loaded if ollama else [],
+                    is_root, warnings, compute_by_device,
+                    ollama_running=ollama is not None, servers=servers)
 
 
 # ---------------------------------------------------------------------------
@@ -1163,6 +1377,12 @@ def _metric_lines(dev: GpuDevice, averages: dict[str, dict[str, float]],
         row("Power", "power", now, watts, note)
     else:
         row("Power", "power", dev.power_watts, watts)
+
+    def mhz(v: float) -> str:
+        return f"{v:.0f} MHz"
+
+    row("GPU clock", "sclk", dev.sclk_mhz, mhz, "shader (gfx/compute) clock")
+    row("Mem clock", "mclk", dev.mclk_mhz, mhz)
     shown = set()
     for x in dev.temperature_sensors:
         shown.add(x.label)
@@ -1181,11 +1401,39 @@ def _metric_lines(dev: GpuDevice, averages: dict[str, dict[str, float]],
     return lines
 
 
-def _gpu_section(dev: GpuDevice, compute: int | None, models: list[OllamaModel],
-                 width: int, t: Theme, stamp: str,
+SERVER_STATUS_TEXT = {
+    "no reply": f"listening, but no reply within {SERVER_TIMEOUT:g} s",
+    "refused": "connection refused",
+    "unexpected reply": "unexpected reply (not this server's API?)",
+    "unreachable": "unreachable",
+    "port unknown": "running; port not visible (run as root)",
+}
+
+
+def _server_lines(servers: list[ModelServer], width: int, t: Theme) -> list[str]:
+    """Box content: one line per server, and per loaded Ollama model."""
+    ch, lw = t.ch, METRIC_LABEL_WIDTH
+    lines = []
+    for x in servers:
+        head = t.paint(_ljust(x.kind, lw), "bold") + _ljust(x.address or "-", 22) + " "
+        if x.status != "ok":
+            lines.append(head + t.paint(SERVER_STATUS_TEXT.get(x.status, x.status), "yellow"))
+        elif x.loaded:
+            for m in x.loaded:
+                pct = f" ({m.size_vram / m.size * 100:>3.0f}%)" if m.size else ""
+                lines.append(head + f"{m.name} {ch['dot']} {_size(m.size)} total "
+                                    f"{ch['dot']} {_size(m.size_vram)} on GPU{pct}")
+                head = " " * (lw + 23)
+        elif x.models:
+            lines.append(head + ", ".join(x.models))
+        else:
+            lines.append(head + t.paint("running, no model loaded", "dim"))
+    return lines
+
+
+def _gpu_section(dev: GpuDevice, compute: int | None, width: int, t: Theme, stamp: str,
                  averages: dict[str, dict[str, float]] | None = None,
-                 covered: float = 0.0, compact: bool = False,
-                 ollama_running: bool = False) -> list[str]:
+                 covered: float = 0.0, compact: bool = False) -> list[str]:
     ch, inner = t.ch, width - 4
     total, used, free = dev.vram_total, dev.vram_used, dev.vram_free
     tail = f"  {_size(used)} / {_size(total)} used"
@@ -1206,14 +1454,6 @@ def _gpu_section(dev: GpuDevice, compute: int | None, models: list[OllamaModel],
     averages = averages or {}
 
     lines += _metric_lines(dev, averages, covered, t)
-    if ollama_running and not models:
-        lines.append(t.paint(_ljust("Ollama", METRIC_LABEL_WIDTH), "bold")
-                     + t.paint("running, no model loaded", "dim"))
-    for m in models:
-        pct = f" ({m.size_vram / m.size * 100:>3.0f}%)" if m.size else ""
-        lines.append(t.paint(_ljust("Ollama", METRIC_LABEL_WIDTH), "bold")
-                     + f"{m.name} {ch['dot']} {_size(m.size)} total "
-                       f"{ch['dot']} {_size(m.size_vram)} on GPU{pct}")
 
     title = f"GPU {dev.address} {ch['dot']} {dev.name}"
     if stamp:
@@ -1240,8 +1480,26 @@ def _part_size(part: GpuPart) -> int:
 TableRow = tuple  # (line, ProcessUsage or None, bytes in VRAM shown on that line)
 
 
+def _engine_percent(p: ProcessUsage, part: GpuPart, before: dict, elapsed: float) -> str:
+    """Shader time of one program on one GPU since the last refresh, as text."""
+    if part.rocm_allocated:
+        return "n/a"                          # ROCm work is not counted per program
+    busy = None
+    for c in p.client_details:
+        if part.gpu is not None and c.gpu != part.gpu:
+            continue                          # another GPU's row (unknown GPU: all)
+        old = before.get((c.gpu, c.client_id))
+        if old is not None:                   # a client seen in both refreshes
+            delta = sum(c.engine_ns.get(e, 0) - old.get(e, 0) for e in SHADER_ENGINES)
+            busy = (busy or 0) + max(0, delta)
+    if busy is None or elapsed <= 0:
+        return "-"
+    return f"{min(999.0, busy / (elapsed * 1e9) * 100):.0f}%"
+
+
 def _process_table(processes: list[ProcessUsage], devices: list[GpuDevice], width: int,
-                   t: Theme) -> tuple[list[str], list[TableRow], list[str]]:
+                   t: Theme, previous: Snapshot | None = None, elapsed: float = 0.0,
+                   show_engine: bool = False) -> tuple[list[str], list[TableRow], list[str]]:
     """Table head, rows and foot. With one GPU: one row per program. With
     several: one row per program and GPU, with a GPU column. Every bar is the
     share of the VRAM of the GPU in its row; a row whose GPU is unknown gets no
@@ -1253,12 +1511,15 @@ def _process_table(processes: list[ProcessUsage], devices: list[GpuDevice], widt
     gw = 7 if multi else 0                    # "83:00.0": bus:device.function
     dw = 22 if width >= 96 + (gw + 1 if gw else 0) else 0
     fixed = (1 + nw + 1 + 8 + 2 + (gw + 1 if gw else 0) + (dw + 1 if dw else 0)
-             + 9 + 1 + 9 + 2)
+             + 9 + 1 + 9 + 2 + (6 if show_engine else 0))
+    before = ({(c.gpu, c.client_id): c.engine_ns for q in previous.processes
+               for c in q.client_details} if previous is not None else {})
     bw = max(4, width - fixed - 1)
     gpu_head = _ljust("GPU", gw) + " " if gw else ""
     desc_head = _ljust("WHAT IT IS", dw) + " " if dw else ""
     head = [t.paint(f" {_ljust('PROGRAM', nw)} {'PID':>8}  {gpu_head}{desc_head}"
-                    f"{'IN VRAM':>9} {'EVICTED':>9}  USAGE", "bold"),
+                    f"{'IN VRAM':>9} {'EVICTED':>9}{'  GPU%' if show_engine else ''}  "
+                    "USAGE", "bold"),
             t.paint(" " + ch["h"] * (width - 2), "gray")]
     rows: list[TableRow] = []
     sum_vram = sum_evicted = 0
@@ -1300,7 +1561,9 @@ def _process_table(processes: list[ProcessUsage], devices: list[GpuDevice], widt
             vram = _rjust("n/a" if not part.in_vram_known and not part.in_vram else
                           (ch["approx"] if part.in_vram_estimated else "")
                           + _fmt(part.in_vram), 9)
-            rows.append((f" {name} {p.pid:>8}  {gpu}{desc}{vram} {ev}  {bar}", p,
+            engine = (" " + _rjust(_engine_percent(p, part, before, elapsed), 5)
+                      if show_engine else "")
+            rows.append((f" {name} {p.pid:>8}  {gpu}{desc}{vram} {ev}{engine}  {bar}", p,
                          part.in_vram))
     if not rows:
         rows.append((t.paint(" (no programs are using GPU memory)", "dim"), None, 0))
@@ -1355,12 +1618,22 @@ def _status_lines(snap: Snapshot, previous: Snapshot | None, width: int,
     evicted_now = sum(p.graphics_evicted for p in snap.processes)
     partly = "at least " if any(not p.evicted_known for p in snap.processes
                                 if p.client_details) else ""
-    if previous is not None:                  # live view: evidence, not a guess
-        grown = evicted_now - sum(p.graphics_evicted for p in previous.processes)
+    if previous is not None:
+        # Compare each GPU client with itself, so programs that start, exit
+        # or are attributed differently cannot change the result.
+        before = {(c.gpu, c.client_id): c.evicted for q in previous.processes
+                  for c in q.client_details if c.evicted is not None}
+        grown = grew = 0
+        for q in snap.processes:
+            for c in q.client_details:
+                old = before.get((c.gpu, c.client_id))
+                if c.evicted is not None and old is not None and c.evicted > old:
+                    grown += c.evicted - old
+                    grew += 1
         if grown >= EVICTED_HIGHLIGHT:
-            say("bad", "red", f"Evicted graphics memory grew by {_fmt(grown)} since the "
-                "last refresh: more buffers that prefer VRAM are now placed elsewhere "
-                "(moved out, or placed there from the start). This can cause stutter.")
+            say("bad", "red", f"Evicted memory of {grew} GPU client(s) present in both "
+                f"refreshes grew by {_fmt(grown)}: buffers were moved out of VRAM, or new "
+                "ones were placed elsewhere. This can cause stutter.")
     sizes = {d.address: d.vram_total for d in snap.devices}
     for p in snap.processes:                  # requests larger than the card are real
         wanted: dict[str | None, int] = {}
@@ -1388,10 +1661,6 @@ def _status_lines(snap: Snapshot, previous: Snapshot | None, width: int,
                 "where they are, so they are not counted as in VRAM.")
     graphics = [p for p in snap.processes
                 if p.graphics_in_vram + p.graphics_evicted >= MIB]
-    if graphics:
-        top = max(graphics, key=lambda p: p.graphics_in_vram + p.graphics_evicted)
-        say("info", "cyan", f"Largest graphics user: {top.name} "
-            f"({_fmt(top.graphics_in_vram)} in VRAM).")
     if evicted_now > EVICTED_NOTICE and graphics:
         worst = max(graphics, key=lambda p: p.graphics_evicted)
         fix = ("logging out and back in resets it" if worst.name == "gnome-shell"
@@ -1474,13 +1743,19 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
         lines: list[str] = []
         for dev in snap.devices:
             lines += _gpu_section(dev, snap.compute_by_device.get(dev.address),
-                                  snap.models, width, t, stamp,
+                                  width, t, stamp,
                                   snap.averages.get(dev.address), snap.averaged_seconds,
-                                  compact, snap.ollama_running)
+                                  compact)
+        if snap.servers:
+            lines += _box("MODEL SERVERS", _server_lines(snap.servers, width, t), width, t,
+                          color="magenta")
         return lines
 
     header = build_header(False)
-    head, all_rows, foot = _process_table(snap.processes, snap.devices, width, t)
+    elapsed = ((snap.timestamp - previous.timestamp).total_seconds()
+               if previous is not None else 0.0)
+    head, all_rows, foot = _process_table(snap.processes, snap.devices, width, t,
+                                          previous, elapsed, show_engine=bool(refresh))
     rows = all_rows
     all_status = _status_lines(snap, previous, width, t)
     status: list[str] | None = all_status
@@ -1491,6 +1766,9 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
     if any(p.in_vram_estimated for p in snap.processes):
         notes.append(t.paint(f" {ch['approx']} estimate: requested minus evicted, at most what "
                              "the card uses; resident counter unusable", "dim"))
+    if refresh:
+        notes.append(t.paint(" GPU%: shader engine time since the last refresh; n/a for "
+                             "ROCm (not reported per program)", "dim"))
     if any(c.link == "guess" for p in snap.processes for c in p.compute_details):
         notes.append(t.paint(" Which GPU client runs ROCm was guessed (several clients, "
                              "Linux 6.15+): compute/graphics split may be off", "dim"))
@@ -1501,6 +1779,7 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
                          "can exceed the card's usage.", "dim"))
     last = ([t.paint(f" Refreshing every {refresh:g} s {ch['dot']} Ctrl+C to quit", "dim")]
             if refresh and not final else [])
+    credit = [t.paint(" " + CREDIT_LINE, "dim")] if CREDIT_LINE else []
     gap = [""]
     table = True
 
@@ -1514,7 +1793,7 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
             f"{_fmt(sum(row[2] for row in hidden))} in VRAM", "dim"), None, 0)]
 
     def total_lines() -> int:
-        n = len(header) + len(notes) + len(last)
+        n = len(header) + len(notes) + len(last) + len(credit)
         if table:
             n += len(gap) + len(head) + len(rows) + pad_rows + len(foot)
         if status is not None:
@@ -1535,6 +1814,8 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
                 pad_rows = max(0, pad_rows - excess)
         while notes and total_lines() > height:
             notes.pop()
+        if total_lines() > height:
+            credit = []                       # content first; it returns when there is room
         if total_lines() > height and len(all_rows) > 1:
             rows = fold(max(1, len(all_rows) - (total_lines() - height) - 1))
         if total_lines() > height and len(all_status) > 1:
@@ -1558,13 +1839,15 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
                 if refresh and not final else [])
         if not last and hint and total_lines() + 1 <= height:
             last = hint                       # a bigger cut freed room for it again
+        if not credit and CREDIT_LINE and total_lines() + 1 <= height:
+            credit = [t.paint(" " + CREDIT_LINE, "dim")]
 
     out = list(header)
     if table:
         out += gap + head + [row[0] for row in rows] + [""] * pad_rows + foot
     if status is not None:
         out += gap + _box("STATUS", status + [""] * pad_status, width, t, color="gray")
-    out += notes + last
+    out += notes + last + credit
     out = [_fit(line, width, ch["ellipsis"]) for line in out]
     return "\n".join(out[:height] if height else out)
 
@@ -1574,10 +1857,10 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
 # ---------------------------------------------------------------------------
 EPILOG = f"""\
 examples:
-  sudo %(prog)s              one snapshot
-  sudo %(prog)s -r           live view, refreshing every {DEFAULT_REFRESH:g} seconds
-  sudo %(prog)s -r 5         live view, refreshing every 5 seconds
-  sudo %(prog)s --json       machine-readable output (sizes in bytes)
+  sudo python3 %(prog)s              one snapshot
+  sudo python3 %(prog)s -r           live view, refreshing every {DEFAULT_REFRESH:g} seconds
+  sudo python3 %(prog)s -r 5         live view, refreshing every 5 seconds
+  sudo python3 %(prog)s --json       machine-readable output (sizes in bytes)
 
 environment:
   NO_COLOR      set to any value to disable colours
@@ -1588,7 +1871,7 @@ exit status:
   {EXIT_ERROR}  runtime error
   {EXIT_USAGE}  invalid command-line arguments
   {EXIT_UNSUPPORTED}  unsupported system (not Linux, or no AMD GPU using amdgpu)
-"""
+""" + (f"\n{CREDIT_LINE}\n" if CREDIT_LINE else "")
 
 
 def _refresh_seconds(text: str) -> float:
@@ -1604,7 +1887,9 @@ def _refresh_seconds(text: str) -> float:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Show which programs use the VRAM of AMD GPUs on Linux.",
+        prog=f"{PROGRAM}.py",
+        description=f"{PROGRAM} {__version__}: see what is using your AMD GPUs on Linux "
+                    "(memory per program, load, clocks, temperatures, power, model servers).",
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "-r", "--refresh", nargs="?", const=DEFAULT_REFRESH,
@@ -1615,7 +1900,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true",
         help="print JSON instead of the table (with -r: one line per refresh)")
     parser.add_argument(
-        "-V", "--version", action="version", version=f"%(prog)s {__version__}")
+        "-V", "--version", action="version",
+        version=f"{PROGRAM} {__version__}" + (f"\n{CREDIT_LINE}" if CREDIT_LINE else ""))
     return parser
 
 
@@ -1672,7 +1958,7 @@ def _exit_on_signal(signum: int, _frame: object) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    prog = parser.prog
+    prog = PROGRAM
     if hasattr(signal, "SIGPIPE"):
         signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     for name in ("SIGTERM", "SIGHUP"):
