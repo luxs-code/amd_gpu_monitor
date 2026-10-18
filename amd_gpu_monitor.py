@@ -52,7 +52,7 @@ CREDIT_LINE = ("(c) Luxs 2026 · GitHub: https://github.com/luxs-code/amd_gpu_mo
                " · Web: https://mycoding.uk/")
 # ===========================================================================
 
-__version__ = "2.10.0"
+__version__ = "2.10.1"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -1397,7 +1397,7 @@ def _metric_lines(dev: GpuDevice, averages: dict[str, dict[str, float]],
     row("VRAM used", "vram_used", float(dev.vram_used), _fmt)
     if dev.gtt_total:
         row("GTT used", "gtt_used", float(dev.gtt_used), _fmt,
-            "system memory mapped for the GPU, incl. buffers placed there on purpose")
+            "system memory mapped for the GPU (all uses)")
     return lines
 
 
@@ -1779,7 +1779,8 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
                          "can exceed the card's usage.", "dim"))
     last = ([t.paint(f" Refreshing every {refresh:g} s {ch['dot']} Ctrl+C to quit", "dim")]
             if refresh and not final else [])
-    credit = [t.paint(" " + CREDIT_LINE, "dim")] if CREDIT_LINE else []
+    credit_text = " " + CREDIT_LINE.replace("·", ch["dot"])   # "|" in ASCII mode
+    credit = [t.paint(credit_text, "dim")] if CREDIT_LINE else []
     gap = [""]
     table = True
 
@@ -1840,7 +1841,7 @@ def render(snap: Snapshot, theme: Theme, refresh: float | None = None,
         if not last and hint and total_lines() + 1 <= height:
             last = hint                       # a bigger cut freed room for it again
         if not credit and CREDIT_LINE and total_lines() + 1 <= height:
-            credit = [t.paint(" " + CREDIT_LINE, "dim")]
+            credit = [t.paint(credit_text, "dim")]
 
     out = list(header)
     if table:
@@ -1863,8 +1864,9 @@ examples:
   sudo python3 %(prog)s --json       machine-readable output (sizes in bytes)
 
 environment:
-  NO_COLOR      set to any value to disable colours
-  OLLAMA_HOST   Ollama address (default 127.0.0.1:11434)
+  NO_COLOR                set to any value to disable colours
+  OLLAMA_HOST             Ollama address (default 127.0.0.1:11434)
+  AMD_GPU_MONITOR_DEBUG   set to show a full traceback on errors
 
 exit status:
   {EXIT_OK}  success
@@ -1955,7 +1957,19 @@ def _exit_on_signal(signum: int, _frame: object) -> None:
     raise SystemExit(128 + signum)
 
 
+def _tolerant_output() -> None:
+    """Print characters the terminal's encoding lacks as '?' instead of
+    failing (an ASCII-only terminal, a non-ASCII program name or credit)."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _tolerant_output()
     parser = build_parser()
     args = parser.parse_args(argv)
     prog = PROGRAM
@@ -1984,7 +1998,7 @@ def main(argv: list[str] | None = None) -> int:
             print()
         return EXIT_OK
     except Exception as exc:      # last-resort handler: short message, no traceback
-        if os.environ.get("VRAM_DEBUG"):
+        if os.environ.get("AMD_GPU_MONITOR_DEBUG"):
             raise
         print(f"{prog}: error: {exc}", file=sys.stderr)
         return EXIT_ERROR
