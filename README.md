@@ -1,4 +1,4 @@
-MD GPU Monitor
+AMD GPU Monitor
 ===============
 
 A Linux command-line tool that shows which programs use the VRAM of AMD GPUs.
