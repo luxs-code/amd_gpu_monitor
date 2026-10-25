@@ -52,7 +52,7 @@ CREDIT_LINE = ("(c) Luxs 2026 · GitHub: https://github.com/luxs-code/amd_gpu_mo
                " · Web: https://mycoding.uk/")
 # ===========================================================================
 
-__version__ = "2.10.1"
+__version__ = "2.11.0"
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -322,6 +322,8 @@ class ProcessUsage:
     in_vram_capped: bool = False      # an estimate was capped at the card's VRAM use
     rocm_allocated: int = 0           # KFD: ROCm VRAM allocations (not a location)
     in_vram_known: bool = True        # False: ROCm memory with no visible address space
+    age_seconds: float | None = None  # how long the process has been running
+    start_time: str | None = None     # when it started (local time, ISO 8601)
     clients: int = 0
     gpus: list[str] = field(default_factory=list)   # PCI addresses
     client_details: list[ClientUsage] = field(default_factory=list)
@@ -484,6 +486,23 @@ def _linked_client(details: list[ClientUsage],
     if details:
         return max(details, key=_requested_or_resident), "guess"
     return None, "none"
+
+
+def _uptime() -> float | None:
+    """Seconds since boot (/proc/uptime), the clock process start times use."""
+    words = (_read("/proc/uptime") or "").split()
+    try:
+        return float(words[0])
+    except (IndexError, ValueError):
+        return None
+
+
+def _clock_ticks() -> int:
+    """Clock ticks per second, the unit of process start times (USER_HZ)."""
+    try:
+        return int(os.sysconf("SC_CLK_TCK")) or 100
+    except (ValueError, OSError, AttributeError):
+        return 100
 
 
 def _start_time(pid: str) -> int:
@@ -914,8 +933,14 @@ def collect_processes(capacities: dict[str, int], used: dict[str, int] | None = 
             evicted_known=all(c.evicted is not None for c in details),
             in_vram_known=not (kfd and linked is None), clients=len(details)))
 
+    uptime, ticks_per_second, now = _uptime(), _clock_ticks(), time.time()
     for pid, u in usage.items():
         u.name = _safe(_program_name(pid))
+        started = _start_time(pid)            # clock ticks after boot; 0 = unreadable
+        if uptime is not None and started > 0:
+            u.age_seconds = max(0.0, uptime - started / ticks_per_second)
+            u.start_time = datetime.fromtimestamp(now - u.age_seconds).isoformat(
+                timespec="seconds")
         u.description = _describe(u.name)
 
     # Total compute memory on a GPU cannot exceed what the GPU uses either.
@@ -1206,6 +1231,7 @@ def collect(gpus: list[PciGpu]) -> Snapshot:
 # ---------------------------------------------------------------------------
 MIN_WIDTH, MAX_WIDTH = 40, 110   # columns; output is cut to fit, never wrapped
 METRIC_LABEL_WIDTH, METRIC_VALUE_WIDTH = 11, 9
+MIN_BAR_CELLS = 15               # the description column is dropped before bars get shorter
 ROW_SWAP_MARGIN = 0.10           # live view: a row passes the one above only when 10% larger
 PROGRAM_ROWS_MIN = 3             # live view: the program table always has room for 3 rows
 LAYOUT_SETTLE_SECONDS = 60       # live view: a part keeps the largest size it needed this long
@@ -1306,6 +1332,21 @@ def _fmt(nbytes: int) -> str:
 def _size(nbytes: int) -> str:
     """Size in a fixed 8 columns: '20.8 GiB', ' 131 MiB', '   8 MiB'."""
     return f"{_fmt(nbytes):>8}"
+
+
+def _age(seconds: float | None) -> str:
+    """Process age in at most 7 columns, coarser as it grows, so a live view
+    changes it rarely: 45s, 12m, 3h05m, 7d02h."""
+    if seconds is None:
+        return "-"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h{s % 3600 // 60:02d}m"
+    return f"{s // 86400}d{s % 86400 // 3600:02d}h"
 
 
 def _temp_color(sensor: TempSensor) -> str | None:
@@ -1509,15 +1550,17 @@ def _process_table(processes: list[ProcessUsage], devices: list[GpuDevice], widt
     sizes = {d.address: d.vram_total for d in devices}
     position = {d.address: i for i, d in enumerate(devices)}   # same order as the GPU boxes
     gw = 7 if multi else 0                    # "83:00.0": bus:device.function
-    dw = 22 if width >= 96 + (gw + 1 if gw else 0) else 0
-    fixed = (1 + nw + 1 + 8 + 2 + (gw + 1 if gw else 0) + (dw + 1 if dw else 0)
-             + 9 + 1 + 9 + 2 + (6 if show_engine else 0))
+    aw = 7                                    # AGE: "7d02h"
+    lead = 1 + nw + 1 + 8 + 1 + aw + 2 + (gw + 1 if gw else 0)   # columns before WHAT IT IS
+    tail = 9 + 1 + 9 + 2 + (6 if show_engine else 0)             # IN VRAM ... before the bar
+    dw = 22 if width - lead - tail - 1 - 23 >= MIN_BAR_CELLS else 0   # description if room
+    fixed = lead + (dw + 1 if dw else 0) + tail
     before = ({(c.gpu, c.client_id): c.engine_ns for q in previous.processes
                for c in q.client_details} if previous is not None else {})
     bw = max(4, width - fixed - 1)
     gpu_head = _ljust("GPU", gw) + " " if gw else ""
     desc_head = _ljust("WHAT IT IS", dw) + " " if dw else ""
-    head = [t.paint(f" {_ljust('PROGRAM', nw)} {'PID':>8}  {gpu_head}{desc_head}"
+    head = [t.paint(f" {_ljust('PROGRAM', nw)} {'PID':>8} {'AGE':>{aw}}  {gpu_head}{desc_head}"
                     f"{'IN VRAM':>9} {'EVICTED':>9}{'  GPU%' if show_engine else ''}  "
                     "USAGE", "bold"),
             t.paint(" " + ch["h"] * (width - 2), "gray")]
@@ -1563,13 +1606,13 @@ def _process_table(processes: list[ProcessUsage], devices: list[GpuDevice], widt
                           + _fmt(part.in_vram), 9)
             engine = (" " + _rjust(_engine_percent(p, part, before, elapsed), 5)
                       if show_engine else "")
-            rows.append((f" {name} {p.pid:>8}  {gpu}{desc}{vram} {ev}{engine}  {bar}", p,
+            age = _rjust(_age(p.age_seconds), aw)
+            rows.append((f" {name} {p.pid:>8} {age}  {gpu}{desc}{vram} {ev}{engine}  {bar}", p,
                          part.in_vram))
     if not rows:
         rows.append((t.paint(" (no programs are using GPU memory)", "dim"), None, 0))
     total = _rjust((ch["approx"] if sum_estimated else "") + _fmt(sum_vram), 9)
-    label = _ljust("graphics memory total",
-                   nw + 1 + 8 + 2 + (gw + 1 if gw else 0) + (dw + 1 if dw else 0) - 1)
+    label = _ljust("graphics memory total", lead - 2 + (dw + 1 if dw else 0))
     ev_total = ("n/a" if evicted_unknown and not evicted_known       # nothing reported
                 else (ch["atleast"] if evicted_unknown else "") + _fmt(sum_evicted))
     foot = [t.paint(" " + ch["h"] * (width - 2), "gray"),

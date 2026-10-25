@@ -5,41 +5,41 @@ GPU load, clocks, temperatures and power, and the AI model servers running on th
 It is a single Python file with no dependencies beyond the standard library.
 
 ```text
-╭─ GPU 0000:83:00.0 · AMD Radeon RX 7900 XTX · 15:47:13 ───────────────────────────────────────────────╮
-│ VRAM ████████████████████████████████████████████████████████████▓▓▓▓░░░░░  22.4 GiB / 24.0 GiB used │
-│      █ compute (ROCm) 20.8 GiB  ▓ graphics & driver  1.6 GiB  ░ free  1.6 GiB                        │
-│                                                                                                      │
-│                  now    1 min    5 min   15 min   averages complete                                  │
-│ GPU busy        100%      97%      85%      62%                                                      │
-│ Power          314 W    305 W    271 W    198 W   SoC, average sensor · limit 327 W                  │
-│ GPU clock   2482 MHz 2470 MHz 2390 MHz 2100 MHz   shader (gfx/compute) clock                         │
-│ Mem clock   1249 MHz 1249 MHz 1249 MHz 1102 MHz                                                      │
-│ Edge            59°C     58°C     57°C     55°C   limit 100°C                                        │
-│ Hotspot         74°C     73°C     70°C     66°C   limit 110°C                                        │
-│ Memory          68°C     67°C     66°C     64°C   limit 100°C                                        │
-│ VRAM used   22.4 GiB 22.4 GiB 22.4 GiB 18.0 GiB                                                      │
-│ GTT used     1.2 GiB  1.2 GiB  1.1 GiB  922 MiB   system memory mapped for the GPU (all uses)        │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
-╭─ MODEL SERVERS ──────────────────────────────────────────────────────────────────────────────────────╮
-│ Ollama     127.0.0.1:11434        qwen3:32b · 21.8 GiB total · 21.0 GiB on GPU ( 96%)                │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ GPU 0000:83:00.0 · AMD Radeon RX 7900 XTX · 15:47:13 ─────────────────────────────────────────────────────╮
+│ VRAM █████████████████████████████████████████████████████████████████▓▓▓▓▓░░░░░  22.4 GiB / 24.0 GiB used │
+│      █ compute (ROCm) 20.8 GiB  ▓ graphics & driver  1.6 GiB  ░ free  1.6 GiB                              │
+│                                                                                                            │
+│                  now    1 min    5 min   15 min   averages complete                                        │
+│ GPU busy        100%      97%      85%      62%                                                            │
+│ Power          314 W    305 W    271 W    198 W   SoC, average sensor · limit 327 W                        │
+│ GPU clock   2482 MHz 2470 MHz 2390 MHz 2100 MHz   shader (gfx/compute) clock                               │
+│ Mem clock   1249 MHz 1249 MHz 1249 MHz 1102 MHz                                                            │
+│ Edge            59°C     58°C     57°C     55°C   limit 100°C                                              │
+│ Hotspot         74°C     73°C     70°C     66°C   limit 110°C                                              │
+│ Memory          68°C     67°C     66°C     64°C   limit 100°C                                              │
+│ VRAM used   22.4 GiB 22.4 GiB 22.4 GiB 18.0 GiB                                                            │
+│ GTT used     1.2 GiB  1.2 GiB  1.1 GiB  922 MiB   system memory mapped for the GPU (all uses)              │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ MODEL SERVERS ────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Ollama     127.0.0.1:11434        qwen3:32b · 21.8 GiB total · 21.0 GiB on GPU ( 96%)                      │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 
- PROGRAM                   PID  WHAT IT IS               IN VRAM   EVICTED  GPU%  USAGE
- ──────────────────────────────────────────────────────────────────────────────────────────────────────
- llama-server          2535258  LLM server (llama.cpp)  20.8 GiB         -   n/a  ██████████████████
- gnome-shell            492096  desktop & compositor     665 MiB   125 MiB    6%  ▓▒
- firefox               2452536  web browser               28 MiB         -    1%  ▏
- Xwayland               539042  X11 app support           17 MiB    14 MiB    0%  ▏
- ──────────────────────────────────────────────────────────────────────────────────────────────────────
- graphics memory total                                   710 MiB   139 MiB
+ PROGRAM                   PID     AGE  WHAT IT IS               IN VRAM   EVICTED  GPU%  USAGE
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ llama-server          2535258   2d05h  LLM server (llama.cpp)  20.8 GiB         -   n/a  ████████████████
+ gnome-shell            492096   8d03h  desktop & compositor     665 MiB   125 MiB    6%  ▓▒
+ firefox               2452536   3h12m  web browser               28 MiB         -    1%  ▏
+ Xwayland               539042   8d03h  X11 app support           17 MiB    14 MiB    0%  ▏
+ ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ graphics memory total                                           710 MiB   139 MiB
 
-╭─ STATUS ─────────────────────────────────────────────────────────────────────────────────────────────╮
-│ ⚠ 1.6 GiB VRAM free (7%): little headroom left.                                                      │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ STATUS ───────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ⚠ 1.6 GiB VRAM free (7%): little headroom left.                                                            │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
  █ compute (ROCm)   ▓ graphics   ▒ evicted: prefers VRAM, placed elsewhere   bars: share of the card
  GPU%: shader engine time since the last refresh; n/a for ROCm (not reported per program)
  Shared window images count for each program, so the sum can exceed the card's usage.
- (c) Luxs 2026 · GitHub: https://github.com/<your-account>/amd_gpu_monitor · Web: https://<your-site>
+ (c) Luxs 2026 · GitHub: https://github.com/luxs-code/amd_gpu_monitor · Web: https://mycoding.uk/
 ```
 
 *Example of the live view (`-r`) on one RX 7900 XTX running Ollama.*
@@ -50,6 +50,8 @@ It is a single Python file with no dependencies beyond the standard library.
 - **VRAM per program**, split into memory in VRAM and memory that is *evicted*
   (prefers VRAM but is currently placed elsewhere). ROCm (compute) and graphics
   memory are shown separately.
+- **How long each program has been running**, so a long-running program whose memory
+  keeps growing is easy to spot.
 - **Several GPUs**: one row per program and GPU, each bar scaled to that GPU.
   GPUs linked by XGMI are taken into account.
 - **Live view** with a configurable refresh interval, like `top`:
@@ -91,14 +93,14 @@ show `n/a`.
 Download the single file and run it with Python:
 
 ```sh
-curl -O https://raw.githubusercontent.com/<your-account>/amd_gpu_monitor/main/amd_gpu_monitor.py
+curl -O https://raw.githubusercontent.com/luxs-code/amd_gpu_monitor/main/amd_gpu_monitor.py
 sudo python3 amd_gpu_monitor.py
 ```
 
 Or clone the repository:
 
 ```sh
-git clone https://github.com/<your-account>/amd_gpu_monitor.git
+git clone https://github.com/luxs-code/amd_gpu_monitor.git
 cd amd_gpu_monitor
 sudo python3 amd_gpu_monitor.py
 ```
@@ -134,6 +136,7 @@ without root).
 
 | Column | Meaning |
 |---|---|
+| AGE | How long the program has been running: `45s`, `12m`, `3h05m`, `7d02h` |
 | IN VRAM | Memory of the program that is in VRAM |
 | EVICTED | Memory that prefers VRAM but is currently placed elsewhere |
 | GPU% | Live view only: shader engine time since the last refresh. Several engines working at once can push it above 100% |
@@ -156,8 +159,8 @@ programs do next, they say "can".
 
 `--json` prints the same data as one JSON object; with `-r`, one object per line and
 refresh. All sizes are in bytes. The main keys are `devices` (sensors and VRAM per
-GPU), `processes` (per program, with `parts` per GPU and the raw kernel figures per GPU
-client), `servers`, `averages` (live view only) and `warnings`.
+GPU), `processes` (per program, with its start time and age, `parts` per GPU and the raw
+kernel figures per GPU client), `servers`, `averages` (live view only) and `warnings`.
 
 Values the kernel does not provide come with a flag. For example, check
 `evicted_known` before using `evicted`.
@@ -220,9 +223,9 @@ For GitHub to show the license, add a `LICENSE` file with the MIT license text.
 
 ## Author
 
-(c) Luxs 2026 · GitHub: https://github.com/<your-account>/amd_gpu_monitor · Web: https://<your-site>
+(c) Luxs 2026 · GitHub: https://github.com/luxs-code/amd_gpu_monitor · Web: https://mycoding.uk/
 
 
 ## Version
 
-2.10.1. Run `python3 amd_gpu_monitor.py --version` to see the version you have.
+2.11.0. Run `python3 amd_gpu_monitor.py --version` to see the version you have.
